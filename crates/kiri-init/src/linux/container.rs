@@ -129,6 +129,10 @@ struct Prepared {
     init: bool,
     /// Ulimits, groups and device nodes from the `opts` lines.
     host: HostApplied,
+    /// The child's end of the pipe that says its root is in place (mounts
+    /// made, `pivot_root` done), so a start is not reported before an exec
+    /// can join its mount namespace (#311).
+    root_ready: Option<OwnedFd>,
 }
 
 /// The parts of [`super::hostopts::HostOpts`] the child applies itself.
@@ -298,6 +302,11 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
         prepared.net_ready = Some(r);
         go = Some(w);
     }
+    // The child says when its root and namespace are in place; a start that
+    // returns before that lets an immediate exec join the agent's root
+    // instead of the container's, where its image users don't exist (#311).
+    let (root_ready, child_root_ready) = sys::pipe().map_err(cleanup)?;
+    prepared.root_ready = Some(child_root_ready);
     let (parent_io, child_io) = stdio(&prepared).map_err(cleanup)?;
     let rootfs_c = sys::cstr(&rootfs).map_err(cleanup)?;
 
@@ -314,6 +323,9 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
     if pid == 0 {
         container_child(&prepared, &rootfs_c, &child_io);
     }
+    // The child holds its own copy of the write end: only then does closing
+    // it (the child exiting early) read as EOF here.
+    drop(prepared.root_ready.take());
     if flags & libc::CLONE_NEWNET as u64 != 0 {
         netns = fs::File::open(format!("/proc/{pid}/ns/net")).map_or(0, |f| netns_inode(&f));
     }
@@ -343,6 +355,24 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
             None => e,
         }
     };
+    // Do not report the start until the child's root is in place: before
+    // `pivot_root`, an exec joining its mount namespace gets the agent's
+    // `/etc/passwd`, and an image user such as `dev` is unknown (#311).
+    let mut ready = [0u8; 1];
+    let got = loop {
+        // SAFETY: reading one byte into a local buffer from a pipe we own.
+        let n = unsafe { libc::read(root_ready.as_raw_fd(), ready.as_mut_ptr().cast(), 1) };
+        if n >= 0 {
+            break n;
+        }
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::Interrupted {
+            return Err(kill_child(e));
+        }
+    };
+    if got != 1 {
+        return Err(kill_child(io::Error::other("the container exited before its root was ready")));
+    }
     let mut veths = Vec::new();
     // Not bridged, but with sysctls to write: no network to wait for.
     if let Some(go) = go.take_if(|_| !bridged) {
@@ -771,6 +801,7 @@ fn prepare(argv: StrList<'_>, env: StrList<'_>, cwd: &str, user: &str, hostname:
         shm_size: 64 << 20,
         init: flags & run_flags::INIT != 0,
         host: HostApplied::default(),
+        root_ready: None,
     })
 }
 
@@ -1163,6 +1194,13 @@ fn container_child(p: &Prepared, rootfs: &CStr, io: &ChildStdio) -> ! {
     }
     if p.net_none {
         sys::loopback_up().unwrap_or_else(|e| fail("loopback", e));
+    }
+    if let Some(done) = &p.root_ready {
+        // SAFETY: one byte to a pipe we own: root, mounts and namespaces
+        // are in place, so an exec can join them now.
+        if unsafe { libc::write(done.as_raw_fd(), b"r".as_ptr().cast(), 1) } != 1 {
+            fail("ready", io::Error::last_os_error());
+        }
     }
     if let Some(ready) = &p.net_ready {
         let mut b = [0u8; 1];
